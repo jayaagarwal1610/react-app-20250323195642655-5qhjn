@@ -1,0 +1,178 @@
+name: Deploy React App
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          
+      - name: Generate proper package-lock.json
+        run: |
+          # Remove any existing lock file to avoid conflicts
+          if [ -f "package-lock.json" ]; then rm package-lock.json; fi
+          if [ -f "yarn.lock" ]; then rm yarn.lock; fi
+          
+          # Generate a fresh package-lock.json
+          npm install --package-lock-only
+          echo "Generated fresh package-lock.json"
+          
+      - name: Install dependencies
+        run: npm install
+        
+      - name: Update public path for GitHub Pages
+        run: |
+          if [ -f "package.json" ]; then
+            REPO_NAME=$(echo $GITHUB_REPOSITORY | sed 's/.*\///')
+            if [ -f ".env" ]; then
+              echo "PUBLIC_URL=/$REPO_NAME" >> .env
+            else
+              echo "PUBLIC_URL=/$REPO_NAME" > .env
+            fi
+            # Create or update homepage in package.json
+            npm pkg set homepage="https://$GITHUB_REPOSITORY_OWNER.github.io/$REPO_NAME/"
+            
+            # Update React Router configuration if using it
+            if grep -q "react-router" package.json; then
+              echo "React Router detected, configuring for GitHub Pages..."
+              # Check if we need to add HashRouter configuration
+              if [ ! -f "src/router-config.js" ]; then
+                mkdir -p src
+                cat > src/router-config.js << 'EOL'
+// GitHub Pages compatible routing configuration
+import { HashRouter, BrowserRouter } from 'react-router-dom';
+
+// Use HashRouter for GitHub Pages deployment
+export const Router = process.env.NODE_ENV === 'production' 
+  ? HashRouter 
+  : BrowserRouter;
+
+// Use this for BrowserRouter with correct basename
+export const routerProps = {
+  basename: process.env.PUBLIC_URL
+};
+EOL
+                echo "Created router configuration file"
+              fi
+            fi
+          fi
+      
+      - name: Find and fix template literal errors
+        run: |
+          echo "Checking for files with potential template literal issues..."
+          # Fix any ${} in .env file
+          if [ -f ".env" ]; then
+            sed -i 's/\${/$/g' .env
+            echo "Fixed .env file:"
+            cat .env
+          fi
+          
+          # Fix the react-app-env.d.ts file
+          if [ -f "src/react-app-env.d.ts" ]; then
+            echo "Examining react-app-env.d.ts file:"
+            cat src/react-app-env.d.ts
+            
+            # Check for unclosed backticks and fix them
+            if grep -q '`' src/react-app-env.d.ts; then
+              echo "Fixing unclosed template literals in react-app-env.d.ts"
+              # Replace problematic template literals with string literals
+              sed -i 's/`/"/g' src/react-app-env.d.ts
+              # As a backup approach, create a new simple declaration file
+              echo '/// <reference types="react-scripts" />' > src/react-app-env.d.ts
+              echo "Fixed react-app-env.d.ts:"
+              cat src/react-app-env.d.ts
+            fi
+          fi
+          
+          # Look for other backtick issues in TypeScript files
+          echo "Searching for other unclosed template literals in TypeScript files..."
+          find src -type f -name "*.tsx" -o -name "*.ts" | grep -v "react-app-env.d.ts" | xargs grep -l '`' || echo "No other files with backticks found"
+        
+      - name: Build project
+        run: npm run build
+        
+      - name: Create 404.html for client-side routing
+        run: |
+          echo "Creating 404.html to handle client-side routing..."
+          cp build/index.html build/404.html
+          echo "Created 404.html file"
+          
+          # Create a public folder .nojekyll file to bypass Jekyll processing
+          touch build/.nojekyll
+          echo "Created .nojekyll file"
+          
+          # Create a simple JavaScript redirect script in 404.html
+          cat > build/404.html << 'EOL'
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Redirecting...</title>
+    <script>
+        // Single Page Apps for GitHub Pages
+        // MIT License
+        // This script takes the current URL and converts the path and query
+        // string into just a query string, and then redirects the browser
+        // to the new URL with only a query string and hash fragment.
+        var pathSegmentsToKeep = 1; // Adjust this if needed
+        
+        var l = window.location;
+        var repoName = l.pathname.split('/')[1];
+        var newUrl = l.protocol + '//' + l.hostname + (l.port ? ':' + l.port : '');
+        
+        // If this is a custom domain, remove the repository name
+        if (l.hostname.indexOf('github.io') === -1) {
+            newUrl += '/' + (repoName || '');
+        } else {
+            newUrl += '/' + repoName;
+        }
+        
+        // Append the rest of the URL
+        if (l.pathname.indexOf(repoName) !== -1) {
+            var path = l.pathname.substr(l.pathname.indexOf(repoName) + repoName.length);
+            if (path) {
+                newUrl += '/?p=' + path.replace(/&/g, '~and~').replace(/\//g, '');
+            }
+        }
+        
+        if (l.search) {
+            newUrl += (path ? '&' : '?') + l.search.slice(1).replace(/&/g, '~and~');
+        }
+        
+        l.replace(newUrl + l.hash);
+    </script>
+</head>
+<body>
+    <h1>Redirecting...</h1>
+    <p>If you are not redirected automatically, please click <a id="redirect-link" href="">here</a>.</p>
+    <script>
+        document.getElementById('redirect-link').href = window.location.href.replace('/404.html', '');
+    </script>
+</body>
+</html>
+EOL
+          
+          # Add the spa-redirect script to index.html
+          sed -i '/<head>/a \    <script type="text/javascript">\n        // This script checks if a redirect is required\n        (function(l) {\n            if (l.search[1] === "/") {\n                var decoded = l.search.slice(1).split("&").map(function(s) { \n                    return s.replace(/~and~/g, "&")\n                }).join("?");\n                window.history.replaceState(null, null,\n                    l.pathname.slice(0, -1) + decoded + l.hash\n                );\n            }\n        }(window.location))\n    </script>' build/index.html
+          
+          echo "Updated index.html with redirect script"
+        
+      - name: Deploy to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: build # The folder the action should deploy
+          branch: gh-pages # The branch the action should deploy to 
